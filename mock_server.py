@@ -19,12 +19,41 @@ from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import StreamingResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
+from contextlib import asynccontextmanager
 import asyncio
 import os
+import sys
 import random
 from typing import Any
 
-app = FastAPI()
+# Import database components
+sys.path.insert(0, os.path.dirname(__file__))
+from backend.database.engine import engine, Base
+from backend.routers import projects as projrouter
+from backend.routers import webui
+from loguru import logger
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Manage database lifecycle"""
+    if engine is not None:
+        # Startup: Create tables
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+            logger.info("Database tables created/verified")
+
+    yield
+
+    if engine is not None:
+        # Shutdown: Close connections
+        await engine.dispose()
+        logger.info("Database connections closed")
+
+app = FastAPI(title="FLASK Copilot Mock Backend", lifespan=lifespan)
+
+# Include database API routes
+app.include_router(projrouter.router)
+app.include_router(webui.router)
 
 # CORS for development
 app.add_middleware(
@@ -35,16 +64,17 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Note: Frontend serving is now handled by webui router
 BUILD_PATH = os.path.join(os.path.dirname(__file__), "flask-app", "build")
 STATIC_PATH = os.path.join(BUILD_PATH, "static")
 
-if os.path.exists(STATIC_PATH):
-    # Serve the frontend
-    app.mount("/static", StaticFiles(directory=STATIC_PATH), name="static")
-
-    @app.get("/")
-    async def root():
-        return FileResponse(os.path.join(BUILD_PATH, "index.html"))
+# if os.path.exists(STATIC_PATH):
+#     # Serve the frontend
+#     app.mount("/static", StaticFiles(directory=STATIC_PATH), name="static")
+#
+#     @app.get("/")
+#     async def root():
+#         return FileResponse(os.path.join(BUILD_PATH, "index.html"))
 
 
 def generate_tree_structure(start_smiles: str, depth: int = 3):
