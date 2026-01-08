@@ -135,6 +135,10 @@ const MarkdownText = ({ text }) => {
   );
 };
 
+// Session configuration
+const AUTO_SAVE_INTERVAL = 10000; // Auto-save every 10 seconds
+const API_BASE_URL = 'http://localhost:8001'; // Backend API URL
+
 const ChemistryTool = () => {
   const [smiles, setSmiles] = useState('CCO');
   const [problemType, setProblemType] = useState('retrosynthesis');
@@ -167,8 +171,255 @@ const ChemistryTool = () => {
     yield: false,
   });
   const [rdkitModule, setRdkitModule] = useState(null);
+  
+  // Session persistence state
+  const [sessionLoaded, setSessionLoaded] = useState(false);
+  const [sessionRestored, setSessionRestored] = useState(false);
+  const [lastSaved, setLastSaved] = useState(null);
+  const [serverSessionId, setServerSessionId] = useState(null); // Track server-side session
+  const [sessionWasComputing, setSessionWasComputing] = useState(false); // Was computing when saved
+  const [resumeAttempted, setResumeAttempted] = useState(false); // Track if we've tried to resume
+  const [dbSessionId, setDbSessionId] = useState(null); // Track database session ID for auto-save
+  
   const containerRef = useRef(null);
   const wsRef = useRef(null);
+  const autoSaveTimerRef = useRef(null);
+  const pendingResumeRef = useRef(null); // Store pending resume data
+  const isSavingRef = useRef(false); // Prevent concurrent saves
+  
+  // Save session to database
+  const saveSession = async (force = false) => {
+    // Only save if there's meaningful data or force save
+    if (!force && treeNodes.length === 0 && !smiles) return;
+    
+    // Prevent concurrent saves
+    if (isSavingRef.current) return;
+    isSavingRef.current = true;
+    
+    const sessionState = {
+      smiles,
+      problemType,
+      systemPrompt,
+      problemPrompt,
+      promptsModified,
+      autoZoom,
+      treeNodes,
+      edges,
+      offset,
+      zoom,
+      metricsHistory,
+      visibleMetrics,
+      isComputing,
+      serverSessionId,
+    };
+    
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/sessions/save`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          sessionId: dbSessionId, // If we have an existing session, update it
+          state: sessionState,
+        }),
+      });
+      
+      if (response.ok) {
+        const data = await response.json();
+        setDbSessionId(data.sessionId); // Store the session ID for future updates
+        setLastSaved(new Date(data.lastModified));
+        console.log('Session saved to database:', data.sessionId);
+      } else {
+        console.error('Failed to save session to database:', response.status);
+      }
+    } catch (error) {
+      console.error('Failed to save session to database:', error);
+    } finally {
+      isSavingRef.current = false;
+    }
+  };
+  
+  // Load session from database
+  const loadSession = async () => {
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/sessions/latest`);
+      
+      if (!response.ok) {
+        if (response.status === 404) {
+          console.log('No previous session found');
+        }
+        setSessionLoaded(true);
+        return false;
+      }
+      
+      const data = await response.json();
+      
+      if (!data) {
+        setSessionLoaded(true);
+        return false;
+      }
+      
+      const state = data.state;
+      
+      // Check if session is recent (within 24 hours)
+      const sessionTime = new Date(data.lastModified);
+      const now = new Date();
+      const hoursDiff = (now - sessionTime) / (1000 * 60 * 60);
+      
+      if (hoursDiff > 24) {
+        console.log('Session too old, ignoring');
+        setSessionLoaded(true);
+        return false;
+      }
+      
+      // Store the database session ID
+      setDbSessionId(data.sessionId);
+      
+      // Restore state
+      if (state.smiles) setSmiles(state.smiles);
+      if (state.problemType) setProblemType(state.problemType);
+      if (state.systemPrompt !== undefined) setSystemPrompt(state.systemPrompt);
+      if (state.problemPrompt !== undefined) setProblemPrompt(state.problemPrompt);
+      if (state.promptsModified !== undefined) setPromptsModified(state.promptsModified);
+      if (state.autoZoom !== undefined) setAutoZoom(state.autoZoom);
+      if (state.treeNodes) setTreeNodes(state.treeNodes);
+      if (state.edges) setEdges(state.edges);
+      if (state.offset) setOffset(state.offset);
+      if (state.zoom) setZoom(state.zoom);
+      if (state.metricsHistory) setMetricsHistory(state.metricsHistory);
+      if (state.visibleMetrics) setVisibleMetrics(state.visibleMetrics);
+      // Track if computation was running when saved (for potential resume)
+      if (state.isComputing && state.serverSessionId) {
+        setSessionWasComputing(true);
+        setServerSessionId(state.serverSessionId);
+        // Store resume data to attempt after WebSocket connects
+        pendingResumeRef.current = {
+          sessionId: state.serverSessionId,
+          smiles: state.smiles,
+          problemType: state.problemType
+        };
+      }
+      
+      setSessionLoaded(true);
+      setSessionRestored(true);
+      setLastSaved(sessionTime);
+      
+      console.log('Session restored from database:', data.sessionId, state.serverSessionId ? `(server session: ${state.serverSessionId})` : '');
+      return true;
+    } catch (error) {
+      console.error('Failed to load session from database:', error);
+      setSessionLoaded(true);
+      return false;
+    }
+  };
+  
+  // Clear saved session (delete from database)
+  const clearSession = async () => {
+    if (dbSessionId) {
+      try {
+        await fetch(`${API_BASE_URL}/api/sessions/${dbSessionId}`, {
+          method: 'DELETE',
+        });
+        console.log('Session deleted from database:', dbSessionId);
+      } catch (error) {
+        console.error('Failed to delete session from database:', error);
+      }
+    }
+    setDbSessionId(null);
+    setSessionRestored(false);
+    setLastSaved(null);
+    setServerSessionId(null);
+    setSessionWasComputing(false);
+    setResumeAttempted(false);
+    pendingResumeRef.current = null;
+    console.log('Session cleared');
+  };
+  
+  // Attempt to resume a server-side session
+  const resumeServerSession = (socket, sessionId) => {
+    if (!socket || socket.readyState !== WebSocket.OPEN) {
+      console.log('Cannot resume - WebSocket not ready');
+      return;
+    }
+    
+    console.log('Attempting to resume server session:', sessionId);
+    setIsComputing(true);
+    setResumeAttempted(true);
+    
+    socket.send(JSON.stringify({
+      action: 'resume_session',
+      sessionId: sessionId
+    }));
+  };
+  
+  // Load session on mount
+  useEffect(() => {
+    loadSession();
+  }, []);
+  
+  // Auto-save session periodically when there are changes
+  useEffect(() => {
+    if (!sessionLoaded) return;
+    
+    // Clear existing timer
+    if (autoSaveTimerRef.current) {
+      clearInterval(autoSaveTimerRef.current);
+    }
+    
+    // Set up auto-save
+    autoSaveTimerRef.current = setInterval(() => {
+      saveSession();
+    }, AUTO_SAVE_INTERVAL);
+    
+    // Also save on unmount or when significant state changes
+    return () => {
+      if (autoSaveTimerRef.current) {
+        clearInterval(autoSaveTimerRef.current);
+      }
+      saveSession(true);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sessionLoaded, smiles, problemType, treeNodes, edges, metricsHistory]);
+  
+  // Save session before page unload (using sendBeacon for reliability)
+  useEffect(() => {
+    const handleBeforeUnload = () => {
+      // Use sendBeacon for reliable save on page close
+      if (treeNodes.length === 0 && !smiles) return;
+      
+      const sessionState = {
+        smiles,
+        problemType,
+        systemPrompt,
+        problemPrompt,
+        promptsModified,
+        autoZoom,
+        treeNodes,
+        edges,
+        offset,
+        zoom,
+        metricsHistory,
+        visibleMetrics,
+        isComputing,
+        serverSessionId,
+      };
+      
+      const payload = JSON.stringify({
+        sessionId: dbSessionId,
+        state: sessionState,
+      });
+      
+      // sendBeacon is more reliable than fetch for unload events
+      navigator.sendBeacon(`${API_BASE_URL}/api/sessions/save`, new Blob([payload], { type: 'application/json' }));
+    };
+    
+    window.addEventListener('beforeunload', handleBeforeUnload);
+    return () => {
+      window.removeEventListener('beforeunload', handleBeforeUnload);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [smiles, problemType, systemPrompt, problemPrompt, treeNodes, edges, metricsHistory, visibleMetrics, offset, zoom, autoZoom, dbSessionId, serverSessionId, isComputing]);
   
   // Load RDKit.js on mount
   useEffect(() => {
@@ -556,12 +807,42 @@ const ChemistryTool = () => {
       setWsConnected(true);
       setWsReconnecting(false);
       setWsError('');
+      
+      // If there's a pending session resume, attempt it now
+      if (pendingResumeRef.current && !resumeAttempted) {
+        setTimeout(() => {
+          resumeServerSession(socket, pendingResumeRef.current.sessionId);
+        }, 100);
+      }
     };
     
     socket.onmessage = (event) => {
       const data = JSON.parse(event.data);
       
-      if (data.type === 'node') {
+      // Handle session-related messages
+      if (data.type === 'session_started') {
+        console.log('Server session started:', data.sessionId);
+        setServerSessionId(data.sessionId);
+      } else if (data.type === 'session_resumed') {
+        console.log('Server session resumed:', data.sessionId, `(${data.sentNodes}/${data.totalNodes} nodes sent)`);
+        setServerSessionId(data.sessionId);
+        setSessionWasComputing(false);
+        // Server will continue streaming remaining nodes/edges
+      } else if (data.type === 'session_status') {
+        console.log('Session status:', data.status);
+        if (data.status === 'complete' || data.status === 'cancelled') {
+          setIsComputing(false);
+          setSessionWasComputing(false);
+          pendingResumeRef.current = null;
+        }
+      } else if (data.type === 'session_not_found') {
+        console.log('Session not found on server - computation ended or expired');
+        setIsComputing(false);
+        setSessionWasComputing(false);
+        setServerSessionId(null);
+        pendingResumeRef.current = null;
+        // The tree state was already restored from localStorage, so user can see what was computed
+      } else if (data.type === 'node') {
         setTreeNodes(prev => [...prev, data]);
       } else if (data.type === 'edge') {
         setEdges(prev => [...prev, data]);
@@ -571,6 +852,8 @@ const ChemistryTool = () => {
         ));
       } else if (data.type === 'complete') {
         setIsComputing(false);
+        setServerSessionId(null); // Clear session ID when complete
+        pendingResumeRef.current = null;
       } else if (data.type === 'response') {
         console.log('Server response:', data.message);
       } else if (data.type === 'error') {
@@ -609,7 +892,7 @@ const ChemistryTool = () => {
     };
   }, []);
 
-  const reset = () => {
+  const reset = async () => {
     setTreeNodes([]);
     setEdges([]);
     setIsComputing(false);
@@ -618,6 +901,7 @@ const ChemistryTool = () => {
     setContextMenu(null);
     setCustomQueryModal(null);
     setMetricsHistory([]);
+    await clearSession(); // Clear saved session on reset
     if (websocket && websocket.readyState === WebSocket.OPEN) {
       websocket.send(JSON.stringify({ action: 'reset' }));
     }
@@ -1038,9 +1322,45 @@ const ChemistryTool = () => {
             </div>
           </div>
           <p className="text-purple-300">Real-time molecular assistant</p>
+          
+          {/* Session Restoration Banner */}
+          {sessionRestored && treeNodes.length > 0 && (
+            <div className="mt-4 mx-auto max-w-md">
+              <div className="bg-blue-500/20 border border-blue-400/50 rounded-lg px-4 py-2 flex items-center justify-between">
+                <div className="flex items-center gap-2">
+                  <svg className="w-4 h-4 text-blue-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                  </svg>
+                  <span className="text-blue-200 text-sm">
+                    {sessionWasComputing ? (
+                      isComputing ? (
+                        <>Resuming computation...</>
+                      ) : (
+                        <>Previous session restored (computation ended)</>
+                      )
+                    ) : (
+                      <>Previous session restored</>
+                    )}
+                    {lastSaved && (
+                      <span className="text-blue-300/70 ml-1">
+                        (saved {new Date(lastSaved).toLocaleTimeString()})
+                      </span>
+                    )}
+                  </span>
+                </div>
+                <button 
+                  onClick={() => setSessionRestored(false)}
+                  className="text-blue-300 hover:text-blue-100 transition-colors"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+            </div>
+          )}
         </div>
 
-        <div className="flex justify-end gap-2 mb-4">
+        <div className="flex justify-end items-center gap-2 mb-4">
+          <div className="flex gap-2">
           <button onClick={loadContext} disabled={isComputing} className="px-4 py-2 bg-blue-500/30 text-white rounded-lg text-sm font-semibold hover:bg-blue-500/50 transition-all disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2">
             <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12" />
@@ -1063,6 +1383,7 @@ const ChemistryTool = () => {
                 <button onClick={saveFullContext} className="w-full px-4 py-2 text-left text-sm text-white hover:bg-purple-600/50 transition-colors border-t border-purple-400/30">Save Full Context</button>
               </div>
             )}
+          </div>
           </div>
         </div>
 
