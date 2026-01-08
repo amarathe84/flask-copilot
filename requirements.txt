@@ -2,3 +2,6 @@ fastapi
 uvicorn
 python-multipart
 websockets
+sqlalchemy[asyncio]
+aiomysql
+pydantic
