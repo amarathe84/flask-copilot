@@ -289,15 +289,25 @@ const ChemistryTool = () => {
       if (state.zoom) setZoom(state.zoom);
       if (state.metricsHistory) setMetricsHistory(state.metricsHistory);
       if (state.visibleMetrics) setVisibleMetrics(state.visibleMetrics);
+      
+      // Check if computation was in progress - either by isComputing flag or by detecting incomplete edges
+      const hasIncompleteEdges = state.edges && state.edges.some(e => 
+        e.status === 'computing' || e.status === 'pending'
+      );
+      const wasComputing = state.isComputing || hasIncompleteEdges;
+      
       // Track if computation was running when saved (for potential resume)
-      if (state.isComputing && state.serverSessionId) {
+      if (wasComputing && state.smiles) {
+        console.log('Detected incomplete computation, will attempt to resume');
         setSessionWasComputing(true);
-        setServerSessionId(state.serverSessionId);
+        if (state.serverSessionId) {
+          setServerSessionId(state.serverSessionId);
+        }
         // Store resume data to attempt after WebSocket connects
         pendingResumeRef.current = {
           sessionId: state.serverSessionId,
           smiles: state.smiles,
-          problemType: state.problemType
+          problemType: state.problemType || 'retrosynthesis'
         };
       }
       
@@ -836,12 +846,36 @@ const ChemistryTool = () => {
           pendingResumeRef.current = null;
         }
       } else if (data.type === 'session_not_found') {
-        console.log('Session not found on server - computation ended or expired');
-        setIsComputing(false);
+        console.log('Session not found on server - will restart computation');
+        const pendingData = pendingResumeRef.current;
         setSessionWasComputing(false);
         setServerSessionId(null);
         pendingResumeRef.current = null;
-        // The tree state was already restored from localStorage, so user can see what was computed
+        
+        // If we had pending resume data, restart the computation from scratch
+        if (pendingData && pendingData.smiles && socket.readyState === WebSocket.OPEN) {
+          console.log('Restarting computation for:', pendingData.smiles, pendingData.problemType);
+          // Clear existing nodes/edges first
+          setTreeNodes([]);
+          setEdges([]);
+          setOffset({ x: 50, y: 50 });
+          setZoom(1);
+          
+          // Use setTimeout to ensure React has processed the state clear
+          // before we start receiving new data from the server
+          setTimeout(() => {
+            if (socket.readyState === WebSocket.OPEN) {
+              socket.send(JSON.stringify({
+                action: 'compute',
+                smiles: pendingData.smiles,
+                problemType: pendingData.problemType,
+              }));
+            }
+          }, 100);
+        } else {
+          // No pending data or can't restart - stop computing
+          setIsComputing(false);
+        }
       } else if (data.type === 'node') {
         setTreeNodes(prev => [...prev, data]);
       } else if (data.type === 'edge') {
@@ -891,6 +925,21 @@ const ChemistryTool = () => {
       }
     };
   }, []);
+  
+  // Handle session resume when both session is loaded and WebSocket is connected
+  useEffect(() => {
+    if (sessionLoaded && wsConnected && pendingResumeRef.current && !resumeAttempted) {
+      console.log('Session loaded and WebSocket ready, attempting resume...');
+      const pending = pendingResumeRef.current;
+      
+      // Small delay to ensure everything is stable
+      setTimeout(() => {
+        if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+          resumeServerSession(wsRef.current, pending.sessionId);
+        }
+      }, 200);
+    }
+  }, [sessionLoaded, wsConnected, resumeAttempted]);
 
   const reset = async () => {
     setTreeNodes([]);
